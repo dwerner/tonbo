@@ -7,8 +7,8 @@
 //!
 //! Under seal-every-commit + minor compaction (threshold 1, tick 250 ms) a
 //! lone writer — no concurrent callers, no tombstones, no mixed write shapes,
-//! key-only predicates throughout — intermittently observes two defects, both
-//! traceable to the compaction worker's manifest churn:
+//! key-only predicates throughout — intermittently observes three defect
+//! classes, all traceable to the compaction worker's manifest/SST lifecycle:
 //!
 //! 1. `Manifest(Backend(PreconditionFailed))` from a plain
 //!    `Transaction::commit().await` under `CommitAckMode::Strict` +
@@ -16,20 +16,27 @@
 //!    worker's concurrent manifest edit and the conflict surfaces to the
 //!    *user* rather than being retried internally.
 //!
-//! 2. A strictly-acked row briefly **disappearing** from the committing
-//!    handle's own scans — two `db.scan()` calls issued one statement apart
-//!    disagree. The `remove_ssts` + `add_ssts` apply sequence is observable
-//!    as an intermediate generation in which the merged segment is absent
-//!    from the live view, so rows vanish for that generation. A freshly
-//!    opened handle reads the same store correctly, so the on-disk state is
-//!    sound and it is the live view transition that carries the gap.
+//! 2. A strictly-acked row briefly **missing** from the committing handle's
+//!    own scans — two `db.scan()` calls issued one statement apart disagree.
+//!    The `remove_ssts` + `add_ssts` apply sequence is observable as an
+//!    intermediate generation in which the merged segment is absent from the
+//!    live view, so rows vanish for that generation. A freshly opened handle
+//!    reads the same store correctly, so the on-disk state is sound and it is
+//!    the live view transition that carries the gap.
 //!
-//! Both classes are orthogonal to the stale-version-predicate bug fixed on
-//! this branch by `deb56d3` (see `tests/stale_version_filter.rs`): they are
-//! visibility/CAS races, not MVCC filter races. A long-lived handle — which
-//! is how an embedded engine has to hold the DB — observes both under any
-//! compaction cadence; larger `minor_segment_threshold` / `periodic_tick`
-//! shrink the window but do not close it.
+//! 3. `SsTable(Fs(Path(NotFound)))` from the scan itself: the live view still
+//!    references an SST file the worker has already removed (observed
+//!    directly on pure upstream `f95b9e0`).
+//!
+//! All three classes are orthogonal to the stale-version-predicate bug fixed
+//! on this branch by `deb56d3` (see `tests/stale_version_filter.rs`): they are
+//! visibility/CAS/lifecycle races, not MVCC filter races — key-only predicates
+//! make class A impossible in this repro. A long-lived handle — which is how
+//! an embedded engine has to hold the DB — observes them under any compaction
+//! cadence; larger `minor_segment_threshold` / `periodic_tick` shrink the
+//! window but do not close it (the 30 s production tick fires in any run that
+//! outlives 30 s), and the WAL-prune performed by each tick is enough to
+//! trigger classes 1 and 3 even when no minor compaction runs.
 use std::{sync::Arc, time::Duration};
 
 use tonbo::db::wal_tuning::WalConfigExt;
