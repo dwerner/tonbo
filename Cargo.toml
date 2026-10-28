@@ -120,6 +120,11 @@ path = "tests/stale_version_filter.rs"
 required-features = ["tokio"]
 
 [[test]]
+name = "manifest_view_gap"
+path = "tests/manifest_view_gap.rs"
+required-features = ["tokio"]
+
+[[test]]
 name = "read_smoke"
 path = "tests/read_smoke.rs"
 required-features = ["tokio"]
