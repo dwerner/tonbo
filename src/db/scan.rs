@@ -206,11 +206,28 @@ impl TxSnapshot {
         let projection_schema = projected_schema.as_ref().unwrap_or(&db.schema);
         let predicate_scan_schema =
             projection_with_predicate(&db.schema, projection_schema, Some(predicate))?;
-        let split = split_predicate_for_row_filter(predicate, &predicate_scan_schema);
-        let mut pushdown_predicate = split.pushdown;
-        let mut residual_predicate = split.residual;
+        // MVCC correctness gate: only version-invariant predicates (those
+        // referencing key columns alone, evaluated identically on every
+        // stored version of a key) may filter physical rows before the
+        // merge resolves versions. A value-column predicate pushed
+        // pre-merge can drop the newest version of a key while an older
+        // matching version survives, resurrecting stale rows. Everything
+        // else is evaluated as a residual after the merge.
         let read_ts = self.read_view().read_ts();
         let key_schema = db.extractor().key_schema();
+        let split = split_predicate_for_row_filter(predicate, &predicate_scan_schema);
+        let version_invariant = is_version_invariant(predicate, &key_schema);
+        let mut pushdown_predicate = if version_invariant {
+            split.pushdown
+        } else {
+            None
+        };
+        let mut residual_predicate = if version_invariant {
+            split.residual
+        } else {
+            Some(predicate.clone())
+        };
+        let key_only_prune = key_only_subset(predicate, &key_schema).unwrap_or(Expr::True);
         let key_bounds = key_bounds_for_predicate(predicate, &key_schema);
         let key_range = key_range_for_predicate(predicate, &key_schema);
         let (immutable_indexes, immutable_row_sets) = {
@@ -300,7 +317,7 @@ impl TxSnapshot {
             let (mut selection, requires_residual) = prune_sst_selection(
                 &prune_ctx,
                 &storage_path_from_manifest(&db.sst_root, entry.data_path()),
-                predicate,
+                &key_only_prune,
                 read_ts,
                 &predicate_scan_schema,
                 &key_schema,
@@ -399,6 +416,10 @@ where
         .residual
         .is_some();
     let commit_predicate = Expr::lt_eq(MVCC_COMMIT_COL, ScalarValue::UInt64(Some(read_ts.get())));
+    // `predicate` here must already be restricted to version-invariant
+    // (key-column) constraints: pruning row groups/pages/rows by value
+    // columns before MVCC resolution can drop the newest version of a key
+    // and resurrect an older one.
     let prune_predicate = if matches!(predicate, Expr::True) {
         commit_predicate
     } else {
@@ -1347,6 +1368,60 @@ fn is_string_key_type(data_type: &DataType) -> bool {
         data_type,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     )
+}
+
+/// Returns true when the predicate is *version-invariant* under MVCC: every
+/// leaf column it references is a primary-key column, so all stored versions
+/// of any key evaluate identically.
+///
+/// Only such predicates may be applied **before** the merge/version-resolution
+/// step (Parquet row filters, page-level row selection). A predicate on a
+/// value column is version-variant: filtering physical rows pre-merge can drop
+/// the newest version of a key while an older version survives, and the merge
+/// then resurrects the stale version. Such predicates must be evaluated as a
+/// residual after the merge instead.
+fn is_version_invariant(predicate: &Expr, key_schema: &SchemaRef) -> bool {
+    let is_key_column = |column: &str| key_schema.fields().iter().any(|f| f.name() == column);
+    match predicate {
+        Expr::True | Expr::False => true,
+        Expr::Cmp { column, .. }
+        | Expr::Between { column, .. }
+        | Expr::InList { column, .. }
+        | Expr::StartsWith { column, .. }
+        | Expr::IsNull { column, .. } => is_key_column(column),
+        Expr::And(children) | Expr::Or(children) => children
+            .iter()
+            .all(|child| is_version_invariant(child, key_schema)),
+        Expr::Not(child) => is_version_invariant(child, key_schema),
+        _ => false,
+    }
+}
+
+/// Returns the strongest version-invariant sub-predicate implied by
+/// `predicate`, or `None` when no constraint can be applied pre-merge.
+///
+/// Dropping constraints is conservative (the pruned set only grows), so
+/// sub-predicates are sound for pre-merge pruning. Conjunctions distribute
+/// (each conjunct is independently implied); disjunctions and negations do
+/// not, so they are kept only when fully version-invariant.
+fn key_only_subset(predicate: &Expr, key_schema: &SchemaRef) -> Option<Expr> {
+    if is_version_invariant(predicate, key_schema) {
+        return Some(predicate.clone());
+    }
+    match predicate {
+        Expr::And(children) => {
+            let kept: Vec<Expr> = children
+                .iter()
+                .filter_map(|child| key_only_subset(child, key_schema))
+                .collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(Expr::And(kept)),
+            }
+        }
+        _ => None,
+    }
 }
 
 fn combine_and_parts(mut predicates: Vec<Expr>) -> Option<Expr> {

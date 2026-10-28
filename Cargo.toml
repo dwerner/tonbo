@@ -115,6 +115,11 @@ wasm-bindgen-futures = "0.4"
 wasm-bindgen-test = "0.3"
 
 [[test]]
+name = "stale_version_filter"
+path = "tests/stale_version_filter.rs"
+required-features = ["tokio"]
+
+[[test]]
 name = "read_smoke"
 path = "tests/read_smoke.rs"
 required-features = ["tokio"]
