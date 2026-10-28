@@ -362,12 +362,13 @@ async fn plan_scan_prunes_sst_row_groups_and_pages() {
     let ScanSelection::Sst(selection) = selection else {
         panic!("expected sst selection");
     };
-    assert_eq!(selection.row_groups.as_ref(), Some(&vec![1]));
-    let row_selection = selection.row_set.to_row_selection().expect("row selection");
-    let has_skip = row_selection.iter().any(|sel| sel.skip);
-    let has_select = row_selection.iter().any(|sel| !sel.skip);
-    assert!(has_skip && has_select, "expected page-level pruning");
-    assert_eq!(row_selection.row_count(), 40);
+    // MVCC gate: value-column predicates are not version-invariant, so they
+    // are no longer pushed into pre-merge row-group/page pruning (that would
+    // drop the newest row version of a key and resurrect stale rows). The
+    // full predicate becomes a post-merge residual; results are unchanged.
+    assert_eq!(selection.row_groups.as_ref(), None);
+    assert!(plan.pushdown_predicate.is_none());
+    assert!(plan.residual_predicate.is_some());
 
     let stream = db.execute_scan(plan).await.expect("execute");
     let batches = stream.try_collect::<Vec<_>>().await.expect("collect");
@@ -420,7 +421,11 @@ async fn scan_pruning_preserves_pk_order_across_row_groups() {
     let ScanSelection::Sst(selection) = selection else {
         panic!("expected sst selection");
     };
-    assert_eq!(selection.row_groups.as_ref(), Some(&vec![0, 1]));
+    // MVCC gate: value predicates stay post-merge, so no row-group pruning
+    // is planned for them; the residual filter still returns the same rows
+    // in PK order.
+    assert_eq!(selection.row_groups.as_ref(), None);
+    assert!(plan.residual_predicate.is_some());
 
     let stream = db.execute_scan(plan).await.expect("execute");
     let batches = stream.try_collect::<Vec<_>>().await.expect("collect");
@@ -461,7 +466,11 @@ async fn plan_scan_skips_fully_pruned_sst() {
         .await
         .expect("add sst");
 
-    let predicate = Expr::gt("v", ScalarValue::from(1000i32));
+    // Key-column predicates remain prunable pre-merge (every MVCC version of
+    // a key shares its key value), so an out-of-range key still skips the
+    // SST entirely. Value-column predicates can no longer do this — see
+    // is_version_invariant.
+    let predicate = Expr::gt("id", ScalarValue::from("k999999"));
     let snapshot = db.begin_snapshot().await.expect("snapshot");
     let plan = snapshot
         .plan_scan(&db, &predicate, None, None)
@@ -855,8 +864,16 @@ async fn scan_residual_predicate_filters_after_pushdown() {
         .plan_scan(&db, &predicate, None, None)
         .await
         .expect("plan");
-    assert!(plan.pushdown_predicate.is_some());
-    assert!(plan.residual_predicate.is_some());
+    // MVCC gate: the conjunction references a value column, so nothing is
+    // pushed into the pre-merge Parquet row filter (the key-bounds prune
+    // still applies); the full predicate is evaluated as a post-merge
+    // residual. End-to-end results are unchanged.
+    assert!(plan.pushdown_predicate.is_none());
+    assert_eq!(
+        plan.residual_predicate.as_ref(),
+        Some(&predicate),
+        "non-invariant predicate must become the post-merge residual"
+    );
 
     let stream = db.execute_scan(plan).await.expect("execute");
     let batches = stream.try_collect::<Vec<_>>().await.expect("collect");
@@ -890,6 +907,11 @@ async fn scan_schema_sst_only_pushdown_skips_predicate_columns() {
         .expect("flush");
 
     let projection = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    // MVCC gate: `v` is a value column, so the predicate is post-merge
+    // residual only — it can no longer be pushed pre-merge (that is what let
+    // stale versions resurrect). The residual keeps the predicate column in
+    // the scan schema; key-column predicates still take the
+    // pushdown-skips-columns path (see the key-pruning tests above).
     let predicate = Expr::gt("v", ScalarValue::from(0i32));
     let snapshot = db.begin_snapshot().await.expect("snapshot");
     let plan = snapshot
@@ -903,8 +925,8 @@ async fn scan_schema_sst_only_pushdown_skips_predicate_columns() {
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    assert_eq!(scan_fields, vec!["id"]);
-    assert!(plan.residual_predicate.is_none());
+    assert_eq!(scan_fields, vec!["id", "v"]);
+    assert!(plan.residual_predicate.is_some());
 
     let stream = db.execute_scan(plan).await.expect("execute");
     let batches = stream.try_collect::<Vec<_>>().await.expect("collect");
